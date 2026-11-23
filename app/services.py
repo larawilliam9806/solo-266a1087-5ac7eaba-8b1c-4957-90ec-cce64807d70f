@@ -1,4 +1,4 @@
-"""业务服务层：暂存上传、列对照校验、换交易务、批次/版号查询。"""
+"""业务服务层：暂存上传、列对照校验、换交易务、残件抢救、批次/版号查询。"""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,12 @@ from dataclasses import dataclass
 
 from .constants import METRIC_KEYS, METRIC_LABELS, UNITS
 from .db import get_db
-from .parquet_tools import is_numeric_column, parquet_columns
+from .parquet_tools import (
+    SalvageResult,
+    is_numeric_column,
+    parquet_columns,
+    salvage_row_groups,
+)
 
 
 class ValidationError(Exception):
@@ -213,7 +218,246 @@ def publish_version(
     return PublishResult(batch_id, batch_no, version_id, next_no)
 
 
-# ---------- 查询 ----------
+# ---------- 残件抢救（换交页） ----------
+
+def _wanted_columns(tree_id_column: str, mappings: dict[str, tuple[str, str]]) -> list[str]:
+    """沿用样木号列与高度列选择，保持原件列顺序去重。"""
+    wanted = [tree_id_column]
+    for source_col, _unit in mappings.values():
+        if source_col not in wanted:
+            wanted.append(source_col)
+    return wanted
+
+
+def create_salvage_job(
+    batch_id: int,
+    stage: sqlite3.Row,
+    tree_id_column: str,
+    mappings: dict[str, tuple[str, str]],
+    salvage_dir: str,
+) -> sqlite3.Row:
+    """对暂存残件逐行组试读，生成抢救派生件并登记抢救任务。
+
+    无可用行、抢救件写入失败都抛 ValidationError，不产生任务记录；
+    暂存原件保留不动，用户可放弃后重新换交。
+    """
+    batch = get_batch(batch_id)
+    if batch is None:
+        raise ValidationError("目标批次不存在。")
+    if not os.path.exists(stage["parquet_path"]):
+        raise ValidationError("暂存原件已丢失，请重新上传 Parquet。")
+
+    wanted = _wanted_columns(tree_id_column, mappings)
+    os.makedirs(salvage_dir, exist_ok=True)
+    output_path = os.path.join(salvage_dir, f"{uuid.uuid4().hex}.parquet")
+
+    try:
+        result: SalvageResult = salvage_row_groups(
+            stage["parquet_path"], output_path, wanted
+        )
+    except ValidationError:
+        raise
+    except Exception as exc:  # 行组目录不可读 / 派生件写入失败等：拒绝抢救，清理半成品
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        raise ValidationError(f"残件抢救失败，无法读取或写入派生件：{exc}") from exc
+
+    if not result.kept_groups:
+        raise ValidationError(
+            "抢救结果无任何可完整读取所选列的行组，无可用行，拒绝发布；"
+            "当前正式版与待交原件均保留。"
+        )
+
+    kept_groups_json = json.dumps(result.kept_groups, ensure_ascii=False)
+    dropped_groups_json = json.dumps(
+        [
+            {
+                "row_group_no": g.row_group_no,
+                "source_rows": g.source_rows,
+                "error": g.error,
+            }
+            for g in result.dropped_groups
+        ],
+        ensure_ascii=False,
+    )
+    mappings_json = json.dumps(
+        {key: [column, unit] for key, (column, unit) in mappings.items()},
+        ensure_ascii=False,
+    )
+
+    db = get_db()
+    # 记录“开始抢救时”的正式版，发布时据此检测正式版是否已换交
+    base = db.execute(
+        "SELECT id FROM versions WHERE batch_id = ? AND is_official = 1",
+        (batch_id,),
+    ).fetchone()
+    cur = db.execute(
+        """INSERT INTO salvage_jobs
+               (batch_id, token, parquet_path, salvaged_path, tree_id_column,
+                mappings_json, kept_rows, kept_groups_json, dropped_groups_json,
+                base_official_version_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            batch_id,
+            stage["token"],
+            stage["parquet_path"],
+            result.output_path,
+            tree_id_column,
+            mappings_json,
+            result.kept_rows,
+            kept_groups_json,
+            dropped_groups_json,
+            base["id"] if base else None,
+        ),
+    )
+    db.commit()
+    return get_salvage_job(cur.lastrowid)
+
+
+def get_salvage_job(job_id: int) -> sqlite3.Row | None:
+    return get_db().execute(
+        "SELECT * FROM salvage_jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+
+
+def job_mappings(job: sqlite3.Row) -> dict[str, tuple[str, str]]:
+    raw = json.loads(job["mappings_json"])
+    return {key: (cfg[0], cfg[1]) for key, cfg in raw.items()}
+
+
+def job_dropped_groups(job: sqlite3.Row) -> list[dict]:
+    return json.loads(job["dropped_groups_json"])
+
+
+def job_kept_groups(job: sqlite3.Row) -> list[int]:
+    return json.loads(job["kept_groups_json"])
+
+
+def publish_salvage(
+    job: sqlite3.Row,
+    batch: sqlite3.Row,
+    published_dir: str,
+) -> PublishResult:
+    """确认抢救结果并发布为新正式版。
+
+    以下情况拒绝发布、保留当前正式版和待交原件并说明原因：
+      * 抢救任务不属于该批次；
+      * 抢救件或暂存原件已不在磁盘；
+      * 开始抢救后正式版已被另一次换交替换；
+      * 无可用行（任务登记时已拦截，此处兜底）；
+      * 事务内文件改名/写库失败（回滚并清理新文件）。
+    """
+    db = get_db()
+    if job["batch_id"] != batch["id"]:
+        raise ValidationError("抢救任务与目标批次不匹配。")
+    if not os.path.exists(job["salvaged_path"]):
+        raise ValidationError("抢救派生件已丢失，无法发布；请重新开始抢救。")
+    if not os.path.exists(job["parquet_path"]):
+        raise ValidationError("待交原件已丢失，无法发布；请重新上传后再抢救。")
+    if job["kept_rows"] <= 0:
+        raise ValidationError("抢救结果无可用行，拒绝发布。")
+
+    target_path: str | None = None
+    try:
+        db.execute("BEGIN IMMEDIATE")
+
+        current = db.execute(
+            "SELECT id FROM versions WHERE batch_id = ? AND is_official = 1",
+            (batch["id"],),
+        ).fetchone()
+        current_id = current["id"] if current else None
+        if current_id != job["base_official_version_id"]:
+            raise ValidationError(
+                "开始抢救后该批次正式版已换交，为避免覆盖新正式版，本次抢救拒绝发布；"
+                "当前正式版和待交原件均保留。"
+            )
+
+        next_no = db.execute(
+            "SELECT COALESCE(MAX(version_no), 0) + 1 FROM versions WHERE batch_id = ?",
+            (batch["id"],),
+        ).fetchone()[0]
+
+        batch_dir = os.path.join(published_dir, str(batch["id"]))
+        os.makedirs(batch_dir, exist_ok=True)
+        target_path = os.path.join(batch_dir, f"v{next_no}.parquet")
+        os.replace(job["salvaged_path"], target_path)  # 同卷原子改名
+
+        db.execute(
+            "UPDATE versions SET is_official = 0 WHERE batch_id = ?", (batch["id"],)
+        )
+        cur = db.execute(
+            """INSERT INTO versions
+                   (batch_id, version_no, is_official, parquet_path, tree_id_column)
+               VALUES (?, ?, 1, ?, ?)""",
+            (batch["id"], next_no, target_path, job["tree_id_column"]),
+        )
+        version_id = cur.lastrowid
+        for key, (column, unit) in job_mappings(job).items():
+            db.execute(
+                """INSERT INTO version_metrics (version_id, metric_key, source_column, unit)
+                   VALUES (?, ?, ?, ?)""",
+                (version_id, key, column, unit),
+            )
+        # 弃组清单随正式版永久保存，版号详情可查
+        db.execute(
+            """INSERT INTO version_salvage
+                   (version_id, source_token, kept_rows, kept_groups_json, dropped_groups_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                version_id,
+                job["token"],
+                job["kept_rows"],
+                job["kept_groups_json"],
+                job["dropped_groups_json"],
+            ),
+        )
+
+        db.execute("DELETE FROM salvage_jobs WHERE id = ?", (job["id"],))
+        # 抢救成功后待交原件完成使命，随暂存记录一并清理
+        db.execute("DELETE FROM staged_files WHERE token = ?", (job["token"],))
+        db.commit()
+    except Exception:
+        db.rollback()
+        if target_path and os.path.exists(target_path):
+            try:
+                os.remove(target_path)
+            except OSError:
+                pass
+        raise
+
+    # 事务提交后再清理暂存原件（抢救件已原子改名进正式目录）
+    staged_path = job["parquet_path"]
+    if os.path.exists(staged_path):
+        try:
+            os.remove(staged_path)
+        except OSError:
+            pass
+
+    return PublishResult(batch["id"], batch["batch_no"], version_id, next_no)
+
+
+def get_version_salvage(version_id: int) -> sqlite3.Row | None:
+    return get_db().execute(
+        "SELECT * FROM version_salvage WHERE version_id = ?", (version_id,)
+    ).fetchone()
+
+
+def discard_salvage_job(job_id: int) -> None:
+    """放弃抢救：删除任务与派生件，暂存原件保留，可重新换交。"""
+    db = get_db()
+    job = get_salvage_job(job_id)
+    if job is None:
+        return
+    if os.path.exists(job["salvaged_path"]):
+        try:
+            os.remove(job["salvaged_path"])
+        except OSError:
+            pass
+    db.execute("DELETE FROM salvage_jobs WHERE id = ?", (job_id,))
+    db.commit()
 
 def list_batches() -> list[sqlite3.Row]:
     return get_db().execute(

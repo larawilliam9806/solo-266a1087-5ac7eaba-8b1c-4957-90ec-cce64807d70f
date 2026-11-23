@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}残件抢救确认 · 批次 {{ batch.batch_no }}{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>残件抢救确认 · 批次 {{ batch.batch_no }}</h1>
+  <p class="muted">
+    时点 <code>{{ batch.time_point }}</code> ·
+    样木号列 <code>{{ job.tree_id_column }}</code> ·
+    抢救任务 #{{ job.id }}
+  </p>
+  <table style="max-width:760px">
+    <thead><tr><th>高度指标</th><th>源列</th><th>原始单位</th></tr></thead>
+    <tbody>
+      {% for key, label, _out in metrics %}
+      <tr>
+        <td>{{ label }}</td>
+        {% if key in mappings %}
+        <td><code>{{ mappings[key][0] }}</code></td>
+        <td>{{ '厘米 (cm)' if mappings[key][1] == 'cm' else '米 (m)' }}</td>
+        {% else %}
+        <td class="muted" colspan="2">未配置，输出留空</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p style="margin-top:14px">
+    可读行组 <strong>{{ kept_groups|length }}</strong> 个
+    （原件行组号：{{ kept_groups|join('、') }}），
+    合计保留 <strong>{{ job.kept_rows }}</strong> 行；
+    舍弃行组 <strong>{{ dropped_groups|length }}</strong> 个。
+  </p>
+</div>
+
+<div class="card">
+  <h2>舍弃的原件行组清单（行组号从 1 起，行数为目录所记）</h2>
+  {% if dropped_groups %}
+  <table style="max-width:760px">
+    <thead><tr><th>原件行组号</th><th>目录所记行数</th><th>读取报错</th></tr></thead>
+    <tbody>
+      {% for g in dropped_groups %}
+      <tr>
+        <td>{{ g.row_group_no }}</td>
+        <td>{{ g.source_rows }}</td>
+        <td class="muted"><code>{{ g.error }}</code></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">没有舍弃的行组——所有行组都能完整读出所选列。</p>
+  {% endif %}
+  <p class="muted" style="margin-top:10px">
+    确认发布后，可读行与本弃组清单一并成为新正式版，版号详情可随时查回该清单；
+    若开始抢救后正式版已被其他换交替换、或抢救件写入异常，将拒绝发布并保留当前正式版与待交原件。
+  </p>
+</div>
+
+<div class="card">
+  <h2>可读行预览（前 {{ preview_n }} 行，高度已统一为米，缺项留空）</h2>
+  {% set rows = rows %}
+  {% set headers = headers %}
+  {% include "_preview_table.html" %}
+  <div class="actions">
+    <form method="post" action="{{ url_for('salvage_publish', job_id=job.id) }}"
+          style="display:inline">
+      <button type="submit">确认发布为新正式版</button>
+    </form>
+    <form method="post" action="{{ url_for('salvage_discard', job_id=job.id) }}"
+          style="display:inline">
+      <button type="submit" class="btn secondary">放弃抢救（保留待交原件）</button>
+    </form>
+    <a class="btn light" href="{{ url_for('replace_form', batch_id=batch.id, token=job.token) }}">
+      返回换交页
+    </a>
+  </div>
+</div>
+{% endblock %}

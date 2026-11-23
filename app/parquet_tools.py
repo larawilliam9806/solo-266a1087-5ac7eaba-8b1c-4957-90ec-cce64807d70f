@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import csv
 import io
+import os
+from dataclasses import dataclass, field
 from typing import Iterable, Iterator
 
 import pyarrow as pa
@@ -131,3 +133,94 @@ def csv_chunks(rows: Iterable[dict[str, str]], include_bom: bool = True) -> Iter
             buffer.truncate(0)
     if buffer.tell():
         yield buffer.getvalue().encode("utf-8")
+
+
+# ---------- 残件抢救：按行组试读，整组成败 ----------
+
+@dataclass
+class DroppedGroup:
+    """被舍弃的原件行组（行组号从 1 起）。"""
+
+    row_group_no: int
+    source_rows: int
+    error: str
+
+
+@dataclass
+class SalvageResult:
+    kept_groups: list[int] = field(default_factory=list)  # 原件行组号（从 1 起），按原顺序
+    dropped_groups: list[DroppedGroup] = field(default_factory=list)
+    kept_rows: int = 0
+    output_path: str = ""
+
+
+def salvage_row_groups(
+    source_path: str,
+    output_path: str,
+    wanted_columns: list[str],
+    batch_size: int = READ_BATCH_SIZE,
+) -> SalvageResult:
+    """抢救行组目录仍可读、部分数据已损坏的 Parquet 暂存件。
+
+    仅按所选列探测：每个行组完整读到结尾才算可读，读到一半报错则**整组舍弃**。
+    可读行组按原件中的顺序保留，流式重写成只含所选列的新 Parquet。
+
+    两遍扫描都只持有 ``batch_size`` 大小的 RecordBatch 缓冲，
+    内存不随文件或单个行组的行数增长。
+
+    派生件写入失败会清理半成品并向上抛异常，由调用方拒绝发布。
+    """
+    pf = pq.ParquetFile(source_path)
+    schema = pa.schema([pf.schema_arrow.field(name) for name in wanted_columns])
+    total_groups = pf.num_row_groups
+
+    # 第一遍：逐行组试读所选列；中途任何异常都让该组整体落选
+    kept_indexes: list[int] = []
+    dropped: list[DroppedGroup] = []
+    for rg_idx in range(total_groups):
+        source_rows = pf.metadata.row_group(rg_idx).num_rows
+        try:
+            for batch in pf.iter_batches(
+                batch_size=batch_size,
+                columns=wanted_columns,
+                row_groups=[rg_idx],
+            ):
+                # 触发整批解码：to_pylist 确保列数据页真正被读取，
+                # 而不是只生成惰性引用
+                for name in wanted_columns:
+                    batch.column(name).to_pylist()
+        except Exception as exc:  # 损坏、解压失败、IO 错误等
+            dropped.append(DroppedGroup(rg_idx + 1, source_rows, f"{type(exc).__name__}: {exc}"))
+            continue
+        kept_indexes.append(rg_idx)
+
+    if not kept_indexes:
+        # 无可用行：不生成派生件
+        return SalvageResult(dropped_groups=dropped)
+
+    # 第二遍：可读行组按原顺序流式重写；写失败则清理半成品并抛错
+    kept_rows = 0
+    try:
+        with pq.ParquetWriter(output_path, schema) as writer:
+            for rg_idx in kept_indexes:
+                for batch in pf.iter_batches(
+                    batch_size=batch_size,
+                    columns=wanted_columns,
+                    row_groups=[rg_idx],
+                ):
+                    writer.write_batch(batch)
+                    kept_rows += batch.num_rows
+    except Exception:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        raise
+
+    return SalvageResult(
+        kept_groups=[i + 1 for i in kept_indexes],
+        dropped_groups=dropped,
+        kept_rows=kept_rows,
+        output_path=output_path,
+    )

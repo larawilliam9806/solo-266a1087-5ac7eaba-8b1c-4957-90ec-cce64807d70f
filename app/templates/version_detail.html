@@ -30,6 +30,33 @@
   </div>
 </div>
 
+{% if salvage %}
+<div class="card">
+  <h2>残件抢救清单</h2>
+  <p class="muted">
+    本版由残件抢救生成：保留可读行 <strong>{{ salvage.kept_rows }}</strong> 行，
+    可读行组 {{ salvage.kept_groups|length }} 个（原件行组号：{{ salvage.kept_groups|join('、') }}），
+    舍弃行组 {{ salvage.dropped_groups|length }} 个。
+  </p>
+  {% if salvage.dropped_groups %}
+  <table style="max-width:760px">
+    <thead><tr><th>舍弃的原件行组号（从 1 起）</th><th>目录所记行数</th><th>读取报错</th></tr></thead>
+    <tbody>
+      {% for g in salvage.dropped_groups %}
+      <tr>
+        <td>{{ g.row_group_no }}</td>
+        <td>{{ g.source_rows }}</td>
+        <td class="muted"><code>{{ g.error }}</code></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">无舍弃行组。</p>
+  {% endif %}
+</div>
+{% endif %}
+
 <div class="card">
   <h2>前 {{ preview_n }} 行预览（高度已统一为米，缺项留空）</h2>
   {% include "_preview_table.html" %}

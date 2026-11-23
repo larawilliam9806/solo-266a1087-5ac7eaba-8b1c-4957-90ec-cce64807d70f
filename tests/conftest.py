@@ -20,6 +20,7 @@ def app(tmp_path):
             "DATABASE_PATH": str(data_dir / "test.db"),
             "STAGING_DIR": str(data_dir / "staging"),
             "PUBLISHED_DIR": str(data_dir / "published"),
+            "SALVAGE_DIR": str(data_dir / "salvage"),
         }
     )
     yield application

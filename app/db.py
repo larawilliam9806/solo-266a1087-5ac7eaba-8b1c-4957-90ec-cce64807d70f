@@ -45,6 +45,33 @@ CREATE TABLE IF NOT EXISTS staged_files (
     columns      TEXT NOT NULL,
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 残件抢救任务：一次“开始抢救”对应一行，确认发布或放弃后删除
+CREATE TABLE IF NOT EXISTS salvage_jobs (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id                   INTEGER NOT NULL REFERENCES batches(id),
+    token                      TEXT NOT NULL,
+    parquet_path               TEXT NOT NULL,
+    salvaged_path              TEXT NOT NULL,
+    tree_id_column             TEXT NOT NULL,
+    mappings_json              TEXT NOT NULL,
+    kept_rows                  INTEGER NOT NULL,
+    kept_groups_json           TEXT NOT NULL,
+    dropped_groups_json        TEXT NOT NULL,
+    -- 开始抢救时该批次的正式版；发布时若已变化则拒绝发布
+    base_official_version_id   INTEGER,
+    created_at                 TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 随正式版永久保存的抢救清单（可读行组与舍弃行组）
+CREATE TABLE IF NOT EXISTS version_salvage (
+    version_id           INTEGER PRIMARY KEY REFERENCES versions(id) ON DELETE CASCADE,
+    source_token         TEXT NOT NULL,
+    kept_rows            INTEGER NOT NULL,
+    kept_groups_json     TEXT NOT NULL,
+    dropped_groups_json  TEXT NOT NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

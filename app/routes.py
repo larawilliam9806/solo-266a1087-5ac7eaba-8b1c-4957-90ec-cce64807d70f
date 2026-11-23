@@ -1,6 +1,7 @@
 """Flask 应用工厂与全部 HTTP 路由。"""
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime
 from urllib.parse import quote
@@ -21,14 +22,22 @@ from .db import close_db, init_db, standalone_connection
 from .parquet_tools import csv_chunks, iter_output_rows, preview_rows
 from .services import (
     ValidationError,
+    create_salvage_job,
+    discard_salvage_job,
     get_batch,
+    get_salvage_job,
     get_stage,
     get_version,
+    get_version_salvage,
+    job_dropped_groups,
+    job_kept_groups,
+    job_mappings,
     list_batches,
     list_versions,
     metric_map,
     official_versions_for,
     parse_mappings,
+    publish_salvage,
     publish_version,
     stage_columns,
     stage_upload,
@@ -42,10 +51,12 @@ def create_app(config: dict | None = None) -> Flask:
     data_dir = os.environ.get("DATA_DIR", os.path.join(app.instance_path, "data"))
     staging_dir = os.path.join(data_dir, "staging")
     published_dir = os.path.join(data_dir, "published")
+    salvage_dir = os.path.join(data_dir, "salvage")
     app.config.update(
         DATABASE_PATH=os.path.join(data_dir, "forestry.db"),
         STAGING_DIR=staging_dir,
         PUBLISHED_DIR=published_dir,
+        SALVAGE_DIR=salvage_dir,
     )
     if config:
         app.config.update(config)
@@ -53,6 +64,7 @@ def create_app(config: dict | None = None) -> Flask:
     # 测试可能覆盖目录；按最终配置统一确保目录与库父目录存在
     os.makedirs(app.config["STAGING_DIR"], exist_ok=True)
     os.makedirs(app.config["PUBLISHED_DIR"], exist_ok=True)
+    os.makedirs(app.config["SALVAGE_DIR"], exist_ok=True)
     os.makedirs(os.path.dirname(app.config["DATABASE_PATH"]), exist_ok=True)
 
     init_db(app)
@@ -184,6 +196,102 @@ def create_app(config: dict | None = None) -> Flask:
         flash(f"换交成功：v{result.version_no} 已成为正式版，旧版保留可下载。")
         return redirect(url_for("batch_detail", batch_id=batch_id))
 
+    # ---------- 残件抢救：行组目录可读、部分数据损坏时只保留可读行组 ----------
+    @app.route("/batches/<int:batch_id>/salvage", methods=["POST"])
+    def salvage_start(batch_id: int):
+        batch = get_batch(batch_id)
+        if batch is None:
+            abort(404)
+        stage = get_stage(request.form.get("token", ""))
+        if stage is None:
+            flash("暂存文件已失效，请重新上传 Parquet。", "error")
+            return redirect(url_for("replace_form", batch_id=batch_id))
+        try:
+            columns = stage_columns(stage)
+            tree_id_column = request.form.get("tree_id_column", "").strip()
+            raw_mappings = parse_mappings(request.form)
+            # 沿用换交页的样木号、高度列与单位选择，校验规则完全一致
+            mappings = validate_mappings(
+                stage["parquet_path"], columns, tree_id_column, raw_mappings
+            )
+            job = create_salvage_job(
+                batch_id,
+                stage,
+                tree_id_column,
+                mappings,
+                salvage_dir=app.config["SALVAGE_DIR"],
+            )
+        except ValidationError as exc:
+            flash(str(exc), "error")
+            return redirect(
+                url_for("replace_form", batch_id=batch_id, token=stage["token"])
+            )
+        return redirect(url_for("salvage_preview", job_id=job["id"]))
+
+    @app.route("/salvage/<int:job_id>")
+    def salvage_preview(job_id: int):
+        job = get_salvage_job(job_id)
+        if job is None:
+            flash("抢救任务不存在或已结束，请重新开始抢救。", "error")
+            return redirect(url_for("index"))
+        batch = get_batch(job["batch_id"])
+        if batch is None:
+            abort(404)
+        mappings = job_mappings(job)
+        # 预览只读抢救派生件（只含所选列），行即抢救后将发布的可读行。
+        # 版号发布后才确定，预览表不展示版号列。
+        rows = preview_rows(
+            job["salvaged_path"],
+            job["tree_id_column"],
+            mappings,
+            batch["batch_no"],
+            0,
+        )
+        preview_headers = [c for c in OUTPUT_COLUMNS if c != "version_no"]
+        return render_template(
+            "salvage_preview.html",
+            job=job,
+            batch=batch,
+            mappings=mappings,
+            metrics=HEIGHT_METRICS,
+            kept_groups=job_kept_groups(job),
+            dropped_groups=job_dropped_groups(job),
+            rows=rows,
+            headers=preview_headers,
+            preview_n=PREVIEW_ROWS,
+        )
+
+    @app.route("/salvage/<int:job_id>/publish", methods=["POST"])
+    def salvage_publish(job_id: int):
+        job = get_salvage_job(job_id)
+        if job is None:
+            flash("抢救任务不存在或已结束，请重新开始抢救。", "error")
+            return redirect(url_for("index"))
+        batch = get_batch(job["batch_id"])
+        if batch is None:
+            abort(404)
+        try:
+            result = publish_salvage(job, batch, app.config["PUBLISHED_DIR"])
+        except ValidationError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("salvage_preview", job_id=job_id))
+        flash(
+            f"抢救发布成功：v{result.version_no} 已成为正式版，"
+            f"保留 {job['kept_rows']} 行可读数据，舍弃行组清单随版本保存。"
+        )
+        return redirect(url_for("batch_detail", batch_id=batch["id"]))
+
+    @app.route("/salvage/<int:job_id>/discard", methods=["POST"])
+    def salvage_discard(job_id: int):
+        job = get_salvage_job(job_id)
+        if job is None:
+            return redirect(url_for("index"))
+        batch_id = job["batch_id"]
+        token = job["token"]
+        discard_salvage_job(job_id)
+        flash("已放弃本次抢救，待交原件保留，可重新换交或重新抢救。")
+        return redirect(url_for("replace_form", batch_id=batch_id, token=token))
+
     # ---------- 批次详情 / 版号详情 ----------
     @app.route("/batches/<int:batch_id>")
     def batch_detail(batch_id: int):
@@ -209,6 +317,14 @@ def create_app(config: dict | None = None) -> Flask:
             version["batch_no"],
             version["version_no"],
         )
+        salvage = get_version_salvage(version_id)
+        salvage_info = None
+        if salvage is not None:
+            salvage_info = {
+                "kept_rows": salvage["kept_rows"],
+                "kept_groups": json.loads(salvage["kept_groups_json"]),
+                "dropped_groups": json.loads(salvage["dropped_groups_json"]),
+            }
         return render_template(
             "version_detail.html",
             version=version,
@@ -217,6 +333,7 @@ def create_app(config: dict | None = None) -> Flask:
             rows=rows,
             headers=OUTPUT_COLUMNS,
             preview_n=PREVIEW_ROWS,
+            salvage=salvage_info,
         )
 
     @app.route("/versions/<int:version_id>/download")

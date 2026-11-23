@@ -78,7 +78,21 @@
       <button type="submit">
         {{ '提交换交（生成新版本）' if mode == 'replace' else '发布为正式版' }}
       </button>
+      {% if mode == 'replace' %}
+      <button type="submit" class="btn secondary"
+              formaction="{{ url_for('salvage_start', batch_id=batch.id) }}">
+        残件抢救（逐行组试读，舍弃损坏行组）
+      </button>
+      {% endif %}
     </div>
+    {% if mode == 'replace' %}
+    <p class="muted" style="margin-top:10px">
+      旧普查件行组目录仍可读但部分数据损坏时使用「残件抢救」：
+      沿用上面的样木号列、高度列与单位选择，按原件顺序保留能完整读出所选列的行组；
+      某组读到一半才报错也整组舍弃，并在确认页列出舍弃的原件行组号（从 1 起）与目录所记行数。
+      抢救失败不会影响当前正式版，待交原件保留。
+    </p>
+    {% endif %}
   </form>
 </div>
 {% else %}
